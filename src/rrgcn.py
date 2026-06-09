@@ -8,12 +8,13 @@ from rgcn.layers import UnionRGCNLayer, RGCNBlockLayer
 from model import BaseRGCN
 from decoder import *
 from rise import ANGLLayer
-from anchor_memory import TemporalAnchorMemoryNetwork
+from anchor_memory import ATCEncoder       
+
 try:
     from inductive_enhanced_diffusion import InductiveEnhancedDiffusion
     INDUCTIVE_DIFFUSION_AVAILABLE = True
     print("✅ DiffuTKG归纳式扩散模块已加载")
-except ImportError as e:
+except ImportError:
     INDUCTIVE_DIFFUSION_AVAILABLE = False
 
 class RGCNCell(BaseRGCN):
@@ -54,35 +55,6 @@ class RGCNCell(BaseRGCN):
                     layer(g, [])
             return g.ndata.pop('h')
 
-class TemporalTransformer(nn.Module):
-    def __init__(self, d_model, nhead, num_layers, dropout=0.1):
-        super(TemporalTransformer, self).__init__()
-        self.d_model = d_model
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout, activation='gelu')
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.output_proj = nn.Linear(d_model, d_model)
-
-    def forward(self, x):
-        # x: [N, seq_len, h_dim]
-        x = self.layer_norm(x)
-        seq_len = x.size(1)
-        mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
-        x = x.transpose(0, 1)                   # [seq_len, N, h_dim]
-        x = self.transformer(x, mask=mask)       # [seq_len, N, h_dim]
-        x = x.transpose(0, 1)                   # [N, seq_len, h_dim]
-        x = self.output_proj(x)
-        return x[:, -1, :]                       # [N, h_dim]
-
-    @staticmethod
-    def generate_square_subsequent_mask(sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0.0)
-        return mask
-
 class RecurrentRGCN(nn.Module):
     def __init__(self, decoder_name, encoder_name, num_ents, num_rels,
                  num_static_rels, num_words, num_times, time_interval,
@@ -94,14 +66,16 @@ class RecurrentRGCN(nn.Module):
                  weight=1, discount=0, angle=0, use_static=False,
                  entity_prediction=False, relation_prediction=False,
                  use_cuda=False, gpu=0, analysis=False,
-                 transformer_nhead=4,
-                 transformer_num_layers=2,
+                 atc_K=6,
+                 atc_alpha_s=0.7,
+                 atc_alpha_l=0.3,
+                 atc_decay_s=1.0,
+                 atc_decay_l=0.1,
+                 atc_anchor_loss_lambda=0.5,
+                 atc_loss_weight=0.1,
                  use_anel=False,
                  anel_k_neighbors=6,
                  anel_time_window=3,
-                 anchor_K=6,
-                 anchor_beta_fast=0.5,
-                 anchor_beta_slow=0.1,
                  use_inductive_diffusion=False,
                  use_time_decay=False,
                  use_multikernel_hawkes=False,
@@ -119,6 +93,7 @@ class RecurrentRGCN(nn.Module):
                  meta_lr=0.01,
                  use_distribution_alignment=True,
                  alignment_strength=0.1):
+
         super(RecurrentRGCN, self).__init__()
         self.decoder_name = decoder_name
         self.encoder_name = encoder_name
@@ -165,9 +140,9 @@ class RecurrentRGCN(nn.Module):
         self.emb_rel = nn.Parameter(torch.Tensor(num_rels * 2, h_dim)); nn.init.xavier_normal_(self.emb_rel)
         self.dynamic_emb = nn.Parameter(torch.Tensor(num_ents, h_dim));   nn.init.normal_(self.dynamic_emb)
         self.weight_t1 = nn.Parameter(torch.randn(1, h_dim))
-        self.bias_t1 = nn.Parameter(torch.randn(1, h_dim))
+        self.bias_t1   = nn.Parameter(torch.randn(1, h_dim))
         self.weight_t2 = nn.Parameter(torch.randn(1, h_dim))
-        self.bias_t2 = nn.Parameter(torch.randn(1, h_dim))
+        self.bias_t2   = nn.Parameter(torch.randn(1, h_dim))
 
         if self.use_static:
             self.words_emb = nn.Parameter(torch.Tensor(self.num_words, h_dim))
@@ -201,24 +176,19 @@ class RecurrentRGCN(nn.Module):
             h_dim=h_dim, k_neighbors=anel_k_neighbors,
             time_window=anel_time_window, dropout=dropout)
 
-        self.entity_transformer = TemporalTransformer(
-            h_dim, transformer_nhead, transformer_num_layers, dropout)
-        self.relation_transformer = TemporalTransformer(
-            h_dim, transformer_nhead, transformer_num_layers, dropout)
-        self.entity_fusion_gate = nn.Sequential(nn.Linear(h_dim * 2, h_dim), nn.Sigmoid())
-        self.relation_fusion_gate = nn.Sequential(nn.Linear(h_dim * 2, h_dim), nn.Sigmoid())
-
-        self.anchor_memory = TemporalAnchorMemoryNetwork(
+        self.atc_encoder = ATCEncoder(
             h_dim=h_dim,
             num_rels=num_rels,
-            K=anchor_K,
-            beta_fast=anchor_beta_fast,
-            beta_slow=anchor_beta_slow,
-            dropout=dropout)
-
-        self.anchor_ent_gate = nn.Sequential(nn.Linear(h_dim * 2, h_dim), nn.Sigmoid())
-        self.anchor_rel_gate = nn.Sequential(nn.Linear(h_dim * 2, h_dim), nn.Sigmoid())
-
+            K=atc_K,
+            alpha_s=atc_alpha_s,
+            alpha_l=atc_alpha_l,
+            decay_s=atc_decay_s,
+            decay_l=atc_decay_l,
+            anchor_loss_lambda=atc_anchor_loss_lambda,
+            dropout=dropout,
+        )
+        self.atc_loss_weight = atc_loss_weight
+        self._last_atc_loss = None 
         if decoder_name == "timeconvtranse":
             self.decoder_ob1  = TimeConvTransE(num_ents, h_dim, input_dropout, hidden_dropout, feat_dropout)
             self.decoder_ob2  = TimeConvTransE(num_ents, h_dim, input_dropout, hidden_dropout, feat_dropout)
@@ -228,13 +198,13 @@ class RecurrentRGCN(nn.Module):
             raise NotImplementedError
 
         self.use_inductive_diffusion = use_inductive_diffusion and INDUCTIVE_DIFFUSION_AVAILABLE
-        self.diffusion_noise_level_seen = diffusion_noise_level_seen
-        self.diffusion_noise_level_unseen = diffusion_noise_level_unseen
-        self.ood_loss_weight = ood_loss_weight
-        self.diffusion_loss_weight = diffusion_loss_weight
-        self.distribution_loss_weight = distribution_loss_weight
-        self._diffusion_losses = {}
-        self._seen_entity_ids = None
+        self.diffusion_noise_level_seen    = diffusion_noise_level_seen
+        self.diffusion_noise_level_unseen  = diffusion_noise_level_unseen
+        self.ood_loss_weight               = ood_loss_weight
+        self.diffusion_loss_weight         = diffusion_loss_weight
+        self.distribution_loss_weight      = distribution_loss_weight
+        self._diffusion_losses             = {}
+        self._seen_entity_ids              = None
 
         if self.use_inductive_diffusion:
             self.inductive_diffusion = InductiveEnhancedDiffusion(
@@ -244,33 +214,27 @@ class RecurrentRGCN(nn.Module):
                 use_meta_learning=use_meta_learning, meta_lr=meta_lr,
                 use_distribution_alignment=use_distribution_alignment,
                 alignment_strength=alignment_strength)
-
             self.denoising_net = nn.Sequential(
-                nn.Linear(h_dim * 3, h_dim * 2),
-                nn.SiLU(),
-                nn.Linear(h_dim * 2, h_dim * 2),
-                nn.SiLU(),
+                nn.Linear(h_dim * 3, h_dim * 2), nn.SiLU(),
+                nn.Linear(h_dim * 2, h_dim * 2), nn.SiLU(),
                 nn.Linear(h_dim * 2, h_dim))
-
             self.diffusion_time_emb = nn.Embedding(diffusion_timesteps + 1, h_dim)
-
-            alpha_start = 0.9999
-            alpha_end = 0.0001
+            alpha_start, alpha_end = 0.9999, 0.0001
             betas = torch.linspace(alpha_end, alpha_start, diffusion_timesteps)
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)            # [M]
-            self.register_buffer('alphas_cumprod', alphas_cumprod)   # 不参与梯度更新
+            alphas_cumprod = torch.cumprod(1.0 - betas, dim=0)
+            self.register_buffer('alphas_cumprod', alphas_cumprod)
             self.diffusion_timesteps = diffusion_timesteps
 
-        self._cached_rel_cond = None
+        self._cached_rel_cond      = None
         self._cached_entity_rel_ids = None
         self._cached_neighbor_embs = None
-        self._current_query_ids = None
+        self._current_query_ids    = None
+
     def forward(self, g_list, static_graph, use_cuda):
-        gate_list = []
+        gate_list   = []
         degree_list = []
 
-        entity_history_seq = []
+        entity_history_seq   = []
         relation_history_seq = []
 
         if self.use_static:
@@ -281,23 +245,23 @@ class RecurrentRGCN(nn.Module):
             static_emb = F.normalize(static_emb) if self.layer_norm else static_emb
             self.h = static_emb
         else:
-            self.h = F.normalize(self.dynamic_emb) if self.layer_norm else self.dynamic_emb[:, :]
+            self.h     = F.normalize(self.dynamic_emb) if self.layer_norm else self.dynamic_emb[:, :]
             static_emb = None
 
         history_embs = []
 
-        if self.use_time_decay_gru:
-            device = self.h.device
+        if self.use_time_decay:
+            device    = self.h.device
             last_time = torch.full((self.num_ents,), -1, dtype=torch.long, device=device)
         else:
             last_time = None
 
         for i, g in enumerate(g_list):
             g = g.to(self.gpu)
-            temp_e = self.h[g.r_to_e]
-            x_input = (torch.zeros(self.num_rels*2, self.h_dim).float().cuda()
+            temp_e  = self.h[g.r_to_e]
+            x_input = (torch.zeros(self.num_rels * 2, self.h_dim).float().cuda()
                        if use_cuda
-                       else torch.zeros(self.num_rels*2, self.h_dim).float())
+                       else torch.zeros(self.num_rels * 2, self.h_dim).float())
             for span, r_idx in zip(g.r_len, g.uniq_r):
                 x_input[r_idx] = torch.mean(temp_e[span[0]:span[1], :], dim=0, keepdim=True)
 
@@ -310,77 +274,59 @@ class RecurrentRGCN(nn.Module):
             current_h = F.normalize(current_h) if self.layer_norm else current_h
 
             if self.use_anel:
-                node_ids_cur = g.ndata['id'].squeeze().long().to(current_h.device)
-
+                node_ids_cur    = g.ndata['id'].squeeze().long().to(current_h.device)
                 hist_graphs_win = g_list[max(0, i - self.anel_time_window): i]
-
-                current_h_full = self.h.clone()
+                current_h_full  = self.h.clone()
                 current_h_full[node_ids_cur] = current_h
                 current_h_full = self.anel(
                     g, current_h_full, self.h_0,
-                    history_graphs = hist_graphs_win,
-                    history_node_embs = None,
-                    query_ids = self._current_query_ids)
+                    history_graphs=hist_graphs_win,
+                    history_node_embs=None,
+                    query_ids=self._current_query_ids)
                 current_h = (F.normalize(current_h_full, dim=-1)
                              if self.layer_norm
                              else current_h_full)[node_ids_cur]
 
-            delta_t = torch.clamp(float(i) - last_time.float(), min=0.0)
-
-            if self.use_multikernel_hawkes:
-                alpha = torch.sigmoid(self.hawkes_alpha)
-                decay = (alpha * torch.exp(-self.gru_beta_fast * delta_t)
-                            + (1-alpha) * torch.exp(-self.gru_beta_slow * delta_t)).unsqueeze(1)
+            if self.use_time_decay and last_time is not None:
+                delta_t = torch.clamp(float(i) - last_time.float(), min=0.0)
+                if self.use_multikernel_hawkes:
+                    alpha = torch.sigmoid(self.hawkes_alpha)
+                    decay = (alpha * torch.exp(-self.gru_beta_fast * delta_t)
+                             + (1 - alpha) * torch.exp(-self.gru_beta_slow * delta_t)).unsqueeze(1)
+                else:
+                    decay = torch.exp(-self.gru_beta * delta_t).unsqueeze(1)
+                h_for = self.h * decay
             else:
-                decay = torch.exp(-self.gru_beta * delta_t).unsqueeze(1)
-            h_for = self.h * decay
+                h_for = self.h
 
             self.h = self.entity_cell_1(current_h, h_for)
             self.h = F.normalize(self.h) if self.layer_norm else self.h
             history_embs.append(self.h)
 
-            last_time[g.ndata['id'].squeeze().long().to(self.h.device)] = i
+            if self.use_time_decay and last_time is not None:
+                last_time[g.ndata['id'].squeeze().long().to(self.h.device)] = i
 
             entity_history_seq.append(self.h.clone())
             relation_history_seq.append(self.h_0.clone())
 
-        if self.use_anchor_memory and len(entity_history_seq) > 0:
-            h_anchor, r_anchor = self.anchor_memory(
-                entity_history_seq, relation_history_seq)
-
-            gate_ent = self.anchor_ent_gate(
-                torch.cat([self.h, h_anchor], dim=-1))       # [num_ents, h_dim]
-            self.h = gate_ent * self.h + (1 - gate_ent) * h_anchor
-            self.h = F.normalize(self.h) if self.layer_norm else self.h
-
-            gate_rel = self.anchor_rel_gate(
-                torch.cat([self.h_0, r_anchor], dim=-1))     # [num_rels*2, h_dim]
-            self.h_0 = gate_rel * self.h_0 + (1 - gate_rel) * r_anchor
-            self.h_0 = F.normalize(self.h_0) if self.layer_norm else self.h_0
-
+        if len(entity_history_seq) > 0:
+            h_atc, r_atc, anchor_embs, _ = self.atc_encoder(
+                entity_history_seq=entity_history_seq,
+                relation_history_seq=relation_history_seq,
+                h_current=self.h,
+                r_current=self.h_0,
+            )
+            self.h   = F.normalize(h_atc) if self.layer_norm else h_atc
+            self.h_0 = F.normalize(r_atc) if self.layer_norm else r_atc
             if history_embs:
                 history_embs[-1] = self.h.clone()
 
-            entity_history_seq[-1]   = self.h.clone()
-            relation_history_seq[-1] = self.h_0.clone()
-
-        if self.use_transformer and len(entity_history_seq) > 0:
-            ent_seq = torch.stack(entity_history_seq, dim=1)   # [num_ents, seq_len, h_dim]
-            transformer_ent_out = self.entity_transformer(ent_seq)
-
-            gate_ent = self.entity_fusion_gate(
-                torch.cat([self.h, transformer_ent_out], dim=-1))
-            self.h = gate_ent * self.h + (1 - gate_ent) * transformer_ent_out
-            self.h = F.normalize(self.h) if self.layer_norm else self.h
-            if history_embs:
-                history_embs[-1] = self.h.clone()
-
-            rel_seq = torch.stack(relation_history_seq, dim=1) # [num_rels*2, seq_len, h_dim]
-            transformer_rel_out = self.relation_transformer(rel_seq)
-            gate_rel   = self.relation_fusion_gate(
-                torch.cat([self.h_0, transformer_rel_out], dim=-1))
-            self.h_0   = gate_rel * self.h_0 + (1 - gate_rel) * transformer_rel_out
-            self.h_0   = F.normalize(self.h_0) if self.layer_norm else self.h_0
+            if self.training and anchor_embs is not None:
+                self._last_atc_loss = self.atc_encoder.anchor_loss(
+                    self.h, anchor_embs
+                )
+            else:
+                self._last_atc_loss = None
 
         if self.use_inductive_diffusion and hasattr(self, 'inductive_diffusion'):
             rel_cond       = self._build_entity_rel_cond_from_anchor()
@@ -395,7 +341,6 @@ class RecurrentRGCN(nn.Module):
                     self.inductive_diffusion.update_seen_statistics(self.h[seen_ids].detach())
                 else:
                     self.inductive_diffusion.update_seen_statistics(self.h.detach())
-
                 is_seen_labels = self._make_pseudo_unseen_labels(self.h.shape[0])
                 _, losses = self.inductive_diffusion(
                     self.h, rel_cond, mode='train',
@@ -416,6 +361,126 @@ class RecurrentRGCN(nn.Module):
 
         return history_embs, static_emb, self.h_0, gate_list, degree_list
 
+    def predict(self, test_graph, num_rels, static_graph, test_triplets,
+                entity_history_vocabulary, rel_history_vocabulary, use_cuda):
+        self.use_cuda = use_cuda
+        with torch.no_grad():
+            inv_triples = test_triplets[:, [2, 1, 0, 3]].clone()
+            inv_triples[:, 1] += num_rels
+            all_triples = torch.cat((test_triplets, inv_triples))
+
+            self._current_query_ids = torch.cat([
+                all_triples[:, 0], all_triples[:, 2]
+            ]).unique()
+
+            evolve_embs, _, r_emb, _, _ = self.forward(test_graph, static_graph, use_cuda)
+            self._current_query_ids = None
+
+            embedding  = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+            time_embs  = self.get_init_time(all_triples)
+
+            score_rel = torch.log(
+                self.history_rate * self.rel_history_mode(embedding, r_emb, time_embs, all_triples, rel_history_vocabulary)
+                + (1 - self.history_rate) * self.rel_raw_mode(embedding, r_emb, time_embs, all_triples))
+            score = torch.log(
+                self.history_rate * self.history_mode(embedding, r_emb, time_embs, all_triples, entity_history_vocabulary)
+                + (1 - self.history_rate) * self.raw_mode(embedding, r_emb, time_embs, all_triples))
+
+            return all_triples, score, score_rel
+
+    def get_loss(self, glist, triples, static_graph,
+                 entity_history_vocabulary, rel_history_vocabulary, use_cuda):
+        self.use_cuda = use_cuda
+
+        loss_ent    = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        loss_rel    = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        loss_static = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        loss_diff   = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        loss_atc    = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)  
+
+        inv_triples = triples[:, [2, 1, 0, 3]].clone()
+        inv_triples[:, 1] += self.num_rels
+        all_triples = torch.cat([triples, inv_triples]).to(self.gpu)
+
+        self._current_query_ids = torch.cat([
+            all_triples[:, 0], all_triples[:, 2]
+        ]).unique()
+
+        evolve_embs, static_emb, r_emb, _, _ = self.forward(glist, static_graph, use_cuda)
+        self._current_query_ids = None
+
+        pre_emb   = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+        time_embs = self.get_init_time(all_triples)
+
+        score_en = torch.log(
+            self.history_rate * self.history_mode(pre_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
+            + (1 - self.history_rate) * self.raw_mode(pre_emb, r_emb, time_embs, all_triples))
+        loss_ent += F.nll_loss(score_en, all_triples[:, 2])
+
+        score_re = torch.log(
+            self.history_rate * self.rel_history_mode(pre_emb, r_emb, time_embs, all_triples, rel_history_vocabulary)
+            + (1 - self.history_rate) * self.rel_raw_mode(pre_emb, r_emb, time_embs, all_triples))
+        loss_rel += F.nll_loss(score_re, all_triples[:, 1])
+
+        if self.use_static:
+            for time_step, evolve_emb in enumerate(evolve_embs):
+                step = (self.angle * math.pi / 180) * (time_step + 1 if self.discount == 1 else 1)
+                if self.layer_norm:
+                    sim_matrix = torch.sum(static_emb * F.normalize(evolve_emb), dim=1)
+                else:
+                    sim_matrix = torch.sum(static_emb * evolve_emb, dim=1)
+                    c = (torch.norm(static_emb, p=2, dim=1)
+                         * torch.norm(evolve_emb, p=2, dim=1))
+                    sim_matrix = sim_matrix / c
+                mask = (math.cos(step) - sim_matrix) > 0
+                loss_static += self.weight * torch.sum(
+                    torch.masked_select(math.cos(step) - sim_matrix, mask))
+                
+        if self.use_inductive_diffusion and self._diffusion_losses:
+            dl = self._diffusion_losses
+            if 'ood_cls'    in dl: loss_diff += self.ood_loss_weight       * dl['ood_cls']
+            if 'ood_contrast' in dl: loss_diff += self.ood_loss_weight * 0.1 * dl['ood_contrast']
+            if 'diffusion'  in dl: loss_diff += self.diffusion_loss_weight * dl['diffusion']
+            if 'distribution' in dl: loss_diff += self.distribution_loss_weight * dl['distribution']
+            if 'meta'       in dl: loss_diff += 0.1 * dl['meta']
+            self._diffusion_losses = {}
+
+        if self._last_atc_loss is not None:
+            loss_atc = loss_atc + self.atc_loss_weight * self._last_atc_loss
+            self._last_atc_loss = None
+
+        return loss_ent, loss_rel, loss_static, loss_diff, loss_atc   # ← 新增返回值
+
+    def get_init_time(self, quadrupleList):
+        T_idx = (quadrupleList[:, 3] // self.time_interval).unsqueeze(1).float()
+        t1 = self.weight_t1 * T_idx + self.bias_t1
+        t2 = self.sin(self.weight_t2 * T_idx + self.bias_t2)
+        return t1, t2
+
+    def raw_mode(self, pre_emb, r_emb, time_embs, all_triples):
+        return F.softmax(
+            self.decoder_ob1.forward(pre_emb, r_emb, time_embs, all_triples).view(-1, self.num_ents), dim=1)
+
+    def history_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
+        global_index = (torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)).to('cuda')
+                        if self.use_cuda
+                        else torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)))
+        return F.softmax(
+            self.decoder_ob2.forward(pre_emb, r_emb, time_embs, all_triples,
+                                     partial_embeding=global_index), dim=1)
+
+    def rel_raw_mode(self, pre_emb, r_emb, time_embs, all_triples):
+        return F.softmax(
+            self.rdecoder_re1.forward(pre_emb, r_emb, time_embs, all_triples).view(-1, 2 * self.num_rels), dim=1)
+
+    def rel_history_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
+        global_index = (torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)).to('cuda')
+                        if self.use_cuda
+                        else torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)))
+        return F.softmax(
+            self.rdecoder_re2.forward(pre_emb, r_emb, time_embs, all_triples,
+                                      partial_embeding=global_index), dim=1)
+
     def _make_pseudo_unseen_labels(self, num_entities, unseen_ratio=0.3):
         labels   = torch.ones(num_entities, dtype=torch.long, device=self.h.device)
         n_unseen = max(1, int(num_entities * unseen_ratio))
@@ -423,10 +488,8 @@ class RecurrentRGCN(nn.Module):
         return labels
 
     def _build_entity_rel_cond_from_anchor(self):
-        device = self.h.device
         num_ents = self.h.shape[0]
-        rel_cond = self.h_0.mean(dim=0).unsqueeze(0).expand(num_ents, -1).clone()
-        return rel_cond
+        return self.h_0.mean(dim=0).unsqueeze(0).expand(num_ents, -1).clone()
 
     def _build_entity_rel_ids(self, g_list):
         entity_rel_ids = torch.zeros(self.num_ents, dtype=torch.long, device=self.h.device)
@@ -441,8 +504,7 @@ class RecurrentRGCN(nn.Module):
                 from collections import Counter
                 ent_rel_counter = {}
                 for s, d, r in zip(src.tolist(), dst.tolist(), rel_data.tolist()):
-                    sg = node_ids[s].item()
-                    dg = node_ids[d].item()
+                    sg = node_ids[s].item(); dg = node_ids[d].item()
                     rc = min(r, self.num_rels - 1)
                     ent_rel_counter.setdefault(sg, Counter())[rc] += 1
                     ent_rel_counter.setdefault(dg, Counter())[rc] += 1
@@ -466,11 +528,9 @@ class RecurrentRGCN(nn.Module):
             from collections import defaultdict
             neighbors = defaultdict(set)
             for s, d in zip(src.tolist(), dst.tolist()):
-                sg = node_ids[s].item()
-                dg = node_ids[d].item()
+                sg = node_ids[s].item(); dg = node_ids[d].item()
                 if sg < num_ents and dg < num_ents:
-                    neighbors[sg].add(dg)
-                    neighbors[dg].add(sg)
+                    neighbors[sg].add(dg); neighbors[dg].add(sg)
             for eid, nbr_set in neighbors.items():
                 if eid >= num_ents:
                     continue
@@ -488,120 +548,3 @@ class RecurrentRGCN(nn.Module):
 
     def set_seen_entity_ids(self, seen_entity_ids: set):
         self._seen_entity_ids = seen_entity_ids
-
-    def predict(self, test_graph, num_rels, static_graph, test_triplets,
-                entity_history_vocabulary, rel_history_vocabulary, use_cuda):
-        self.use_cuda = use_cuda
-        with torch.no_grad():
-            inv_triples = test_triplets[:, [2, 1, 0, 3]].clone()
-            inv_triples[:, 1] += num_rels
-            all_triples = torch.cat((test_triplets, inv_triples))
-
-            self._current_query_ids = torch.cat([
-                all_triples[:, 0],
-                all_triples[:, 2]
-            ]).unique()
-
-            evolve_embs, _, r_emb, _, _ = self.forward(test_graph, static_graph, use_cuda)
-
-            self._current_query_ids = None
-
-            embedding = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
-            time_embs = self.get_init_time(all_triples)
-
-            score_rel = torch.log(
-                self.history_rate * self.rel_history_mode(embedding, r_emb, time_embs, all_triples, rel_history_vocabulary)
-                + (1 - self.history_rate) * self.rel_raw_mode(embedding, r_emb, time_embs, all_triples))
-            score = torch.log(
-                self.history_rate * self.history_mode(embedding, r_emb, time_embs, all_triples, entity_history_vocabulary)
-                + (1 - self.history_rate) * self.raw_mode(embedding, r_emb, time_embs, all_triples))
-
-            return all_triples, score, score_rel
-
-    def get_loss(self, glist, triples, static_graph,
-                 entity_history_vocabulary, rel_history_vocabulary, use_cuda):
-        self.use_cuda = use_cuda
-
-        loss_ent = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_rel = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_static = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_diff = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-
-        inv_triples = triples[:, [2, 1, 0, 3]].clone()
-        inv_triples[:, 1] += self.num_rels
-        all_triples = torch.cat([triples, inv_triples]).to(self.gpu)
-
-        self._current_query_ids = torch.cat([
-            all_triples[:, 0],
-            all_triples[:, 2]
-        ]).unique()
-
-        evolve_embs, static_emb, r_emb, _, _ = self.forward(glist, static_graph, use_cuda)
-        self._current_query_ids = None
-        pre_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
-        time_embs = self.get_init_time(all_triples)
-
-        score_en = torch.log(
-                self.history_rate * self.history_mode(pre_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
-                + (1 - self.history_rate) * self.raw_mode(pre_emb, r_emb, time_embs, all_triples))
-        loss_ent += F.nll_loss(score_en, all_triples[:, 2])
-
-        score_re = torch.log(
-                self.history_rate * self.rel_history_mode(pre_emb, r_emb, time_embs, all_triples, rel_history_vocabulary)
-                + (1 - self.history_rate) * self.rel_raw_mode(pre_emb, r_emb, time_embs, all_triples))
-        loss_rel += F.nll_loss(score_re, all_triples[:, 1])
-
-        if self.use_static:
-            for time_step, evolve_emb in enumerate(evolve_embs):
-                step = (self.angle * math.pi / 180) * (time_step + 1 if self.discount == 1 else 1)
-                if self.layer_norm:
-                    sim_matrix = torch.sum(static_emb * F.normalize(evolve_emb), dim=1)
-                else:
-                    sim_matrix = torch.sum(static_emb * evolve_emb, dim=1)
-                    c = (torch.norm(static_emb, p=2, dim=1)
-                                  * torch.norm(evolve_emb, p=2, dim=1))
-                    sim_matrix = sim_matrix / c
-                mask = (math.cos(step) - sim_matrix) > 0
-                loss_static += self.weight * torch.sum(
-                    torch.masked_select(math.cos(step) - sim_matrix, mask))
-
-        if self.use_inductive_diffusion and self._diffusion_losses:
-            dl = self._diffusion_losses
-            if 'ood_cls' in dl: loss_diff += self.ood_loss_weight       * dl['ood_cls']
-            if 'ood_contrast' in dl: loss_diff += self.ood_loss_weight * 0.1 * dl['ood_contrast']
-            if 'inductive_enhanced_diffusion.py' in dl: loss_diff += self.diffusion_loss_weight * dl['inductive_enhanced_diffusion.py']
-            if 'distribution' in dl: loss_diff += self.distribution_loss_weight * dl['distribution']
-            if 'meta' in dl: loss_diff += 0.1 * dl['meta']
-            self._diffusion_losses = {}
-
-        return loss_ent, loss_rel, loss_static, loss_diff
-
-    def get_init_time(self, quadrupleList):
-        T_idx = (quadrupleList[:, 3] // self.time_interval).unsqueeze(1).float()
-        t1 = self.weight_t1 * T_idx + self.bias_t1
-        t2 = self.sin(self.weight_t2 * T_idx + self.bias_t2)
-        return t1, t2
-
-    def raw_mode(self, pre_emb, r_emb, time_embs, all_triples):
-        return F.softmax(
-            self.decoder_ob1.forward(pre_emb, r_emb, time_embs, all_triples).view(-1, self.num_ents), dim=1)
-
-    def history_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
-        global_index = (torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)).to('cuda')
-                        if self.use_cuda
-                        else torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)))
-        return F.softmax(
-            self.decoder_ob2.forward(pre_emb, r_emb, time_embs, all_triples,
-                                     partial_embeding=global_index), dim=1)
-
-    def rel_raw_mode(self, pre_emb, r_emb, time_embs, all_triples):
-        return F.softmax(
-            self.rdecoder_re1.forward(pre_emb, r_emb, time_embs, all_triples).view(-1, 2*self.num_rels), dim=1)
-
-    def rel_history_mode(self, pre_emb, r_emb, time_embs, all_triples, history_vocabulary):
-        global_index = (torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)).to('cuda')
-                        if self.use_cuda
-                        else torch.Tensor(np.array(history_vocabulary.cpu(), dtype=float)))
-        return F.softmax(
-            self.rdecoder_re2.forward(pre_emb, r_emb, time_embs, all_triples,
-                                      partial_embeding=global_index), dim=1)
