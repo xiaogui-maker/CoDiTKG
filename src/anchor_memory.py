@@ -1,22 +1,37 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
-class TemporalAnchorMemoryNetwork(nn.Module):
 
-    def __init__(self, h_dim, num_rels, K=6,
-                 beta_fast=0.5, beta_slow=0.1, dropout=0.1):
-        super(TemporalAnchorMemoryNetwork, self).__init__()
+class ATCEncoder(nn.Module):
+
+    def __init__(
+        self,
+        h_dim: int,
+        num_rels: int,
+        K: int = 6,
+        alpha_s: float = 0.7,
+        alpha_l: float = 0.3,
+        decay_s: float = 1.0,
+        decay_l: float = 0.1,
+        anchor_loss_lambda: float = 0.5,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        assert abs(alpha_s + alpha_l - 1.0) < 1e-6, 
 
         self.h_dim = h_dim
         self.num_rels = num_rels
         self.K = K
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
+        self.anchor_loss_lambda = anchor_loss_lambda
 
-        self.logit_alpha = nn.Parameter(torch.tensor(0.0))   # αs 初始值 0.5
+    
+        self._hawkes_logits = nn.Parameter(
+            torch.tensor([alpha_s, alpha_l]).log()
+        )
+        self.log_decay_s = nn.Parameter(torch.tensor(decay_s).log())
+        self.log_decay_l = nn.Parameter(torch.tensor(decay_l).log())
+        self.mu = nn.Parameter(torch.zeros(1))   
 
         self.W_Q = nn.Linear(h_dim, h_dim, bias=False)
         self.W_K = nn.Linear(h_dim, h_dim, bias=False)
@@ -25,93 +40,136 @@ class TemporalAnchorMemoryNetwork(nn.Module):
         self.phi = nn.Sequential(
             nn.Linear(h_dim * 2, h_dim * 2),
             nn.ReLU(),
-            nn.Linear(h_dim * 2, h_dim))
+            nn.Dropout(dropout),
+            nn.Linear(h_dim * 2, h_dim),
+        )
 
-        self.w_r = nn.Linear(h_dim * 2, 1)   # 合并Linear+bias
+        self.w_r = nn.Linear(h_dim * 2, 1, bias=True)
 
         self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(h_dim)
+        self.layer_norm_ent = nn.LayerNorm(h_dim)
+        self.layer_norm_rel = nn.LayerNorm(h_dim)
 
-    def _select_anchors(self, seq_len):
-        K = min(self.K, seq_len)
-        if K == seq_len:
-            return list(range(seq_len))
-        indices = [int(round(i * (seq_len - 1) / (K - 1))) for i in range(K)]
-        return sorted(set(indices))
+        self._init_weights()
 
-    def _hawkes_weights(self, anchor_indices, current_t):
+    def _init_weights(self):
+        for m in [self.W_Q, self.W_K, self.W_V]:
+            nn.init.xavier_uniform_(m.weight)
+        for layer in self.phi:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        nn.init.xavier_uniform_(self.w_r.weight)
+        nn.init.zeros_(self.w_r.bias)
 
-        device  = self.logit_alpha.device
-        alpha_s = torch.sigmoid(self.logit_alpha)
-        alpha_l = 1.0 - alpha_s
+    def _hawkes_intensity(
+        self,
+        event_times: torch.Tensor,  
+        query_time: float,          
+    ) -> torch.Tensor:
+        
+        alpha = F.softmax(self._hawkes_logits, dim=0)   # [α_s, α_l]
+        decay_s = self.log_decay_s.exp().clamp(min=1e-3)
+        decay_l = self.log_decay_l.exp().clamp(min=1e-3)
 
-        weights = []
-        for ak in anchor_indices:
-            delta_t = float(current_t - ak)
-            w = (alpha_s * torch.exp(torch.tensor(-self.beta_fast * delta_t, device=device))
-               + alpha_l * torch.exp(torch.tensor(-self.beta_slow * delta_t, device=device)))
-            weights.append(w)
+        delta = (query_time - event_times).clamp(min=0.0)   # [L]，Δt ≥ 0
 
-        weights = torch.stack(weights)
-        weights = weights / (weights.sum() + 1e-10)
-        return weights
+        g_s = torch.exp(-decay_s * delta)
+        g_l = torch.exp(-decay_l * delta)
 
-    def _anchor_attention_entity(self, h_current, anchor_embs, hawkes_weights):
-        num_ents = h_current.size(0)
-        K = anchor_embs.size(0)
-        scale = math.sqrt(self.h_dim)
+        intensity = self.mu + alpha[0] * g_s + alpha[1] * g_l   # [L]
 
-        Q = self.W_Q(h_current)                           # [num_ents, h_dim]
-        anchor_embs_t = anchor_embs.permute(1, 0, 2)      # [num_ents, K, h_dim]
-        K_proj = self.W_K(anchor_embs_t)                  # [num_ents, K, h_dim]
-        V_proj = self.W_V(anchor_embs_t)                  # [num_ents, K, h_dim]
+        intensity = F.softmax(intensity, dim=0)
+        return intensity
 
-        attn_scores = torch.bmm(
-            Q.unsqueeze(1),                               # [num_ents, 1, h_dim]
-            K_proj.transpose(1, 2)                        # [num_ents, h_dim, K]
-        ).squeeze(1) / scale                              # [num_ents, K]
+    def _select_anchors(
+        self,
+        intensity: torch.Tensor,   # [L]
+    ) -> torch.Tensor:
 
-        hawkes_weights = hawkes_weights.to(attn_scores.device)
-        attn_scores = attn_scores * hawkes_weights.unsqueeze(0)  # [num_ents, K]
-        attn_weights = F.softmax(attn_scores, dim=1)              # [num_ents, K]
-        attn_weights = self.dropout(attn_weights)
+        K = min(self.K, intensity.shape[0])
+        _, indices = torch.topk(intensity, K)    # [K]
+        return indices
 
-        context = torch.bmm(
-            attn_weights.unsqueeze(1),                    # [num_ents, 1, K]
-            V_proj                                        # [num_ents, K, h_dim]
-        ).squeeze(1)                                      # [num_ents, h_dim]
+    def forward(
+        self,
+        entity_history_seq: list,    
+        relation_history_seq: list,  
+        h_current: torch.Tensor,     # [num_ents, h_dim]  
+        r_current: torch.Tensor,     # [num_rels*2, h_dim] 
+        timestamps: torch.Tensor | None = None, 
+    ):
+        L = len(entity_history_seq)
+        device = h_current.device
 
-        h_out = self.phi(torch.cat([context, h_current], dim=-1))  # [num_ents, h_dim]
-        h_out = self.layer_norm(h_out + h_current)        # 残差 + LayerNorm
-        return h_out
+        if L == 0:
+            return h_current, r_current, None, None
 
-    def _dynamic_relation_update(self, r_current, anchor_rel_embs, hawkes_weights):
-        hawkes_weights = hawkes_weights.to(r_current.device)
-        r_bar = (anchor_rel_embs * hawkes_weights.view(-1, 1, 1)).sum(dim=0)  # [num_rels*2, h_dim]
-        # βj
-        beta = torch.sigmoid(
-            self.w_r(torch.cat([r_current, r_bar], dim=-1)))   # [num_rels*2, 1]
-        # r̃^T_j
-        r_updated = beta * r_current + (1.0 - beta) * r_bar   # [num_rels*2, h_dim]
-        return r_updated
+        if timestamps is None:
+            timestamps = torch.arange(L, dtype=torch.float, device=device)
+        query_time = float(L) 
 
-    def forward(self, history_embs, history_rel_embs):
-        seq_len = len(history_embs)
-        anchor_indices = self._select_anchors(seq_len)    # List[int], 长度K'≤K
-        K_actual = len(anchor_indices)
-        hawkes_weights = self._hawkes_weights(anchor_indices, seq_len)  # [K']
+        intensity = self._hawkes_intensity(timestamps, query_time)   # [L]
+
+        anchor_idx = self._select_anchors(intensity)                 # [K]
+        K_actual = anchor_idx.shape[0]
+
         anchor_ent_embs = torch.stack(
-            [history_embs[ak] for ak in anchor_indices], dim=0)
-        # anchor_rel_embs: [K', num_rels*2, h_dim]
+            [entity_history_seq[i] for i in anchor_idx.tolist()], dim=0
+        )   # [K, num_ents, h_dim]
+
         anchor_rel_embs = torch.stack(
-            [history_rel_embs[ak] for ak in anchor_indices], dim=0)
-        h_current = history_embs[-1]                      # [num_ents, h_dim]
-        r_current = history_rel_embs[-1]                  # [num_rels*2, h_dim]
+            [relation_history_seq[i] for i in anchor_idx.tolist()], dim=0
+        )   # [K, num_rels*2, h_dim]
 
-        h_anchor = self._anchor_attention_entity(
-            h_current, anchor_ent_embs, hawkes_weights)   # [num_ents, h_dim]
 
-        r_anchor = self._dynamic_relation_update(
-            r_current, anchor_rel_embs, hawkes_weights)   # [num_rels*2, h_dim]
+        hawkes_weights = intensity[anchor_idx]                       # [K]
 
-        return h_anchor, r_anchor
+        hawkes_weights = hawkes_weights / (hawkes_weights.sum() + 1e-8)
+
+        # query: W_Q · h_T → [num_ents, h_dim]
+        Q = self.W_Q(h_current)                                      # [N, d]
+
+
+        # anchor_ent_embs: [K, N, d]
+        K_proj = self.W_K(anchor_ent_embs)                           # [K, N, d]
+        V_proj = self.W_V(anchor_ent_embs)                           # [K, N, d]
+
+
+        # Q: [N, d] -> [1, N, d], K_proj: [K, N, d]
+        dot = (Q.unsqueeze(0) * K_proj).sum(dim=-1) / (self.h_dim ** 0.5)  # [K, N]
+
+
+        attn_scores = dot * hawkes_weights.unsqueeze(1)              # [K, N]
+        attn_weights = F.softmax(attn_scores, dim=0)                 # 在 K 维 softmax
+
+        h_attn = (attn_weights.unsqueeze(-1) * V_proj).sum(dim=0)   # [N, d]
+        h_out = self.phi(torch.cat([h_attn, h_current], dim=-1))     # [N, d]
+        h_out = self.layer_norm_ent(h_out + h_current)             
+
+        r_bar = (hawkes_weights[:, None, None] * anchor_rel_embs).sum(dim=0)  # [R, d]
+
+        beta = torch.sigmoid(
+            self.w_r(torch.cat([r_current, r_bar], dim=-1))
+        )                                                             # [R, 1]
+
+        r_out = beta * r_current + (1.0 - beta) * r_bar
+        r_out = self.layer_norm_rel(r_out)
+
+        return h_out, r_out, anchor_ent_embs, anchor_idx
+
+    def anchor_loss(
+        self,
+        h_current: torch.Tensor,        # [num_ents, h_dim]
+        anchor_ent_embs: torch.Tensor,  # [K, num_ents, h_dim] 
+    ) -> torch.Tensor:
+        if anchor_ent_embs is None:
+            return torch.zeros(1, device=h_current.device)
+        a_last = anchor_ent_embs[-1]                           # [N, d]
+        loss_main = F.mse_loss(h_current, a_last)
+        loss_anchor = sum(
+            F.mse_loss(anchor_ent_embs[k], h_current)
+            for k in range(anchor_ent_embs.shape[0])
+        ) / anchor_ent_embs.shape[0]
+
+        return loss_main + self.anchor_loss_lambda * loss_anchor
