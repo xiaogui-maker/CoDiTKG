@@ -392,34 +392,33 @@ class RecurrentRGCN(nn.Module):
                  entity_history_vocabulary, rel_history_vocabulary, use_cuda):
         self.use_cuda = use_cuda
 
-        loss_ent    = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_rel    = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        loss_ent = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
+        loss_rel = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
         loss_static = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_diff   = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
-        loss_atc    = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)  
+        loss_diff = torch.zeros(1).cuda().to(self.gpu) if use_cuda else torch.zeros(1)
 
         inv_triples = triples[:, [2, 1, 0, 3]].clone()
         inv_triples[:, 1] += self.num_rels
         all_triples = torch.cat([triples, inv_triples]).to(self.gpu)
 
         self._current_query_ids = torch.cat([
-            all_triples[:, 0], all_triples[:, 2]
+            all_triples[:, 0],
+            all_triples[:, 2]
         ]).unique()
 
         evolve_embs, static_emb, r_emb, _, _ = self.forward(glist, static_graph, use_cuda)
         self._current_query_ids = None
-
-        pre_emb   = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
+        pre_emb = F.normalize(evolve_embs[-1]) if self.layer_norm else evolve_embs[-1]
         time_embs = self.get_init_time(all_triples)
 
         score_en = torch.log(
-            self.history_rate * self.history_mode(pre_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
-            + (1 - self.history_rate) * self.raw_mode(pre_emb, r_emb, time_embs, all_triples))
+                self.history_rate * self.history_mode(pre_emb, r_emb, time_embs, all_triples, entity_history_vocabulary)
+                + (1 - self.history_rate) * self.raw_mode(pre_emb, r_emb, time_embs, all_triples))
         loss_ent += F.nll_loss(score_en, all_triples[:, 2])
 
         score_re = torch.log(
-            self.history_rate * self.rel_history_mode(pre_emb, r_emb, time_embs, all_triples, rel_history_vocabulary)
-            + (1 - self.history_rate) * self.rel_raw_mode(pre_emb, r_emb, time_embs, all_triples))
+                self.history_rate * self.rel_history_mode(pre_emb, r_emb, time_embs, all_triples, rel_history_vocabulary)
+                + (1 - self.history_rate) * self.rel_raw_mode(pre_emb, r_emb, time_embs, all_triples))
         loss_rel += F.nll_loss(score_re, all_triples[:, 1])
 
         if self.use_static:
@@ -430,27 +429,23 @@ class RecurrentRGCN(nn.Module):
                 else:
                     sim_matrix = torch.sum(static_emb * evolve_emb, dim=1)
                     c = (torch.norm(static_emb, p=2, dim=1)
-                         * torch.norm(evolve_emb, p=2, dim=1))
+                                  * torch.norm(evolve_emb, p=2, dim=1))
                     sim_matrix = sim_matrix / c
                 mask = (math.cos(step) - sim_matrix) > 0
                 loss_static += self.weight * torch.sum(
                     torch.masked_select(math.cos(step) - sim_matrix, mask))
-                
+
         if self.use_inductive_diffusion and self._diffusion_losses:
             dl = self._diffusion_losses
-            if 'ood_cls'    in dl: loss_diff += self.ood_loss_weight       * dl['ood_cls']
+            if 'ood_cls' in dl: loss_diff += self.ood_loss_weight       * dl['ood_cls']
             if 'ood_contrast' in dl: loss_diff += self.ood_loss_weight * 0.1 * dl['ood_contrast']
-            if 'diffusion'  in dl: loss_diff += self.diffusion_loss_weight * dl['diffusion']
+            if 'inductive_enhanced_diffusion.py' in dl: loss_diff += self.diffusion_loss_weight * dl['inductive_enhanced_diffusion.py']
             if 'distribution' in dl: loss_diff += self.distribution_loss_weight * dl['distribution']
-            if 'meta'       in dl: loss_diff += 0.1 * dl['meta']
+            if 'meta' in dl: loss_diff += 0.1 * dl['meta']
             self._diffusion_losses = {}
 
-        if self._last_atc_loss is not None:
-            loss_atc = loss_atc + self.atc_loss_weight * self._last_atc_loss
-            self._last_atc_loss = None
-
-        return loss_ent, loss_rel, loss_static, loss_diff, loss_atc   # ← 新增返回值
-
+        return loss_ent, loss_rel, loss_static, loss_diff
+                     
     def get_init_time(self, quadrupleList):
         T_idx = (quadrupleList[:, 3] // self.time_interval).unsqueeze(1).float()
         t1 = self.weight_t1 * T_idx + self.bias_t1
